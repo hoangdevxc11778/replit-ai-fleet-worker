@@ -1,0 +1,73 @@
+name: AI Fleet Worker
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+concurrency:
+  group: ai-fleet
+  cancel-in-progress: true
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      matrix:
+        machine: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
+    steps:
+      - name: Setup Ollama & Cloudflared
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          
+      - name: Start AI Worker
+        env:
+          KIENAI_SERVER: https://84fb9a52-3b12-4f85-b2a3-3fc1aab8d37f-00-f5haa0mypmhu.pike.replit.dev
+          MACHINE_IDX: ${{ matrix.machine }}
+        run: |
+          cat << 'EOF' > worker.py
+          import os, sys, time, json, urllib.request, subprocess, re
+
+          REPLIT_API_URL = os.environ.get("KIENAI_SERVER", "") + "/api"
+          MACHINE_NAME = f"GH-Action-{user.login}-Worker-{os.environ.get('MACHINE_IDX', '1')}"
+
+          def register_machine():
+              # GitHub Public runners are 4-core, 16GB RAM
+              data = { "hostname": MACHINE_NAME, "arch": "x86_64", "cpuCores": 4, "ramGb": 16, "diskAvailableGb": 14, "hasGpu": False, "ollamaRunning": True }
+              req = urllib.request.Request(f"{REPLIT_API_URL}/machines", method="POST", headers={'Content-Type': 'application/json'})
+              try:
+                  res = urllib.request.urlopen(req, data=json.dumps(data).encode('utf-8'))
+                  return json.loads(res.read().decode())['id']
+              except Exception as e:
+                  print("Register fail:", e)
+                  return None
+
+          def main():
+              subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              time.sleep(5) # Wait for ollama to start
+              
+              cf = subprocess.Popen(["cloudflared", "tunnel", "--url", "http://127.0.0.1:11434"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              
+              tunnel_url = None
+              for line in iter(cf.stderr.readline, ''):
+                  m = re.search(r'https://[-a-zA-Z0-9]+.trycloudflare.com', line)
+                  if m:
+                      tunnel_url = m.group(0)
+                      break
+                      
+              if not tunnel_url: return
+              print(f"Tunnel: {tunnel_url}")
+              
+              m_id = register_machine()
+              if not m_id: return
+              
+              while True:
+                  req = urllib.request.Request(f"{REPLIT_API_URL}/machines/{m_id}/heartbeat", method="POST", headers={'Content-Type': 'application/json'})
+                  try:
+                      urllib.request.urlopen(req, data=json.dumps({"ollamaRunning": True, "diskAvailableGb": 14, "tunnelUrl": tunnel_url}).encode('utf-8'))
+                  except: pass
+                  time.sleep(30)
+          
+          main()
+          EOF
+          python3 worker.py
